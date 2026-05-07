@@ -143,6 +143,14 @@ class KTMoEWrapper:
         # Quantization config (for K-Group SFT methods)
         group_size: int = 128,
         zero_point: bool = True,
+        # V4-2604B SwiGLU asymmetric clamp limit (None for V4-Flash and others).
+        # Threaded through from sglang kt_ep_wrapper.py to match the trtllm /
+        # deep_gemm gemm1_clamp_limit reference. Currently a no-op here because
+        # the AMX kernel companion plumb-through (feat/v4-2604b-swiglu-clamp:
+        # d10bd3d) hasn't landed in main; accept-and-drop preserves V4-Flash
+        # correctness (no clamp is the trtllm reference for non-2604B).
+        # yiqiliu2 / 2026-05-07.
+        swiglu_limit: Optional[float] = None,
     ):
         """
         Factory method to create the appropriate backend implementation.
