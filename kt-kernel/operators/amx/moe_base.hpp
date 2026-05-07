@@ -35,6 +35,20 @@
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
 
+// SFINAE detection: does B::required_size_scale_only(int, int, int) exist?
+// Used to gate kt_direct_pointer mode at compile time so non-FP4 BufferB types
+// don't trip on missing methods.
+template <typename B, typename = void>
+struct kt_direct_supported : std::false_type {};
+
+template <typename B>
+struct kt_direct_supported<
+    B, std::void_t<decltype(B::required_size_scale_only(0, 0, 0))>>
+    : std::true_type {};
+
+template <typename B>
+inline constexpr bool kt_direct_supported_v = kt_direct_supported<B>::value;
+
 template <class T, class Derived>
 class AMX_MOE_BASE {
  public:
@@ -116,6 +130,54 @@ class AMX_MOE_BASE {
       up_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
+
+      // Direct-pointer mode: only allocate fp32 scale buffers; weight pointer (bb->b)
+      // is set to safetensor mmap right here. Saves ~127 GB heap on V4-Flash
+      // (88 GB host doesn't fit otherwise). Only available when the BufferB type
+      // provides required_size_scale_only (FP4 BufferBInt4KGroupImpl).
+      // Set b in init() (not load_weights()) so it survives the gap between init
+      // and load_weights — sglang's cuda graph capture path otherwise dispatches
+      // CPU compute on a wrapper whose load_weights hasn't yet set b → null deref.
+      // load_weights re-applies the correct physical→logical mapping later.
+      if constexpr (kt_direct_supported_v<typename T::BufferB>) {
+        if (config_.kt_direct_pointer) {
+          int kgs = config_.quant_config.group_size;
+          using dt = typename T::BufferB::dt;
+          size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / kgs;
+
+          void* gate_scale_ptr = std::aligned_alloc(
+              64, T::BufferB::required_size_scale_only(config_.intermediate_size, config_.hidden_size, kgs));
+          auto gate_b = make_buffer_b_direct(config_.intermediate_size, config_.hidden_size, gate_scale_ptr);
+          if (!config_.gate_projs.empty() && i < config_.gate_projs[0].size())
+            gate_b->b = (dt*)config_.gate_projs[0][i];
+          if (!config_.gate_scales.empty() && i < config_.gate_scales[0].size())
+            convert_or_copy(gate_b->d, (ggml_bf16_t*)config_.gate_scales[0][i], scale_elem_count);
+          gate_bb_.push_back(gate_b);
+
+          void* up_scale_ptr = std::aligned_alloc(
+              64, T::BufferB::required_size_scale_only(config_.intermediate_size, config_.hidden_size, kgs));
+          auto up_b = make_buffer_b_direct(config_.intermediate_size, config_.hidden_size, up_scale_ptr);
+          if (!config_.up_projs.empty() && i < config_.up_projs[0].size())
+            up_b->b = (dt*)config_.up_projs[0][i];
+          if (!config_.up_scales.empty() && i < config_.up_scales[0].size())
+            convert_or_copy(up_b->d, (ggml_bf16_t*)config_.up_scales[0][i], scale_elem_count);
+          up_bb_.push_back(up_b);
+
+          void* down_scale_ptr = std::aligned_alloc(
+              64, T::BufferB::required_size_scale_only(config_.hidden_size, config_.intermediate_size, kgs));
+          auto down_b = make_buffer_b_direct(config_.hidden_size, config_.intermediate_size, down_scale_ptr);
+          if (!config_.down_projs.empty() && i < config_.down_projs[0].size())
+            down_b->b = (dt*)config_.down_projs[0][i];
+          if (!config_.down_scales.empty() && i < config_.down_scales[0].size())
+            convert_or_copy(down_b->d, (ggml_bf16_t*)config_.down_scales[0][i], scale_elem_count);
+          down_bb_.push_back(down_b);
+          continue;
+        }
+      } else {
+        if (config_.kt_direct_pointer) {
+          throw std::runtime_error("kt_direct_pointer set but this BufferB type lacks required_size_scale_only");
+        }
+      }
 
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
@@ -667,6 +729,17 @@ class AMX_MOE_BASE {
   }
   std::shared_ptr<typename T::BufferB> make_buffer_b(size_t n, size_t k, void* data) const {
     return derived_const()->make_buffer_b_impl(n, k, data);
+  }
+  // Direct-pointer BufferB: only owns scale memory (`scale_data`); the weight
+  // pointer (b) is set externally to the safetensor mmap. Derived classes must
+  // override make_buffer_b_direct_impl when they support kt_direct_pointer mode.
+  std::shared_ptr<typename T::BufferB> make_buffer_b_direct(size_t n, size_t k, void* scale_data) const {
+    return derived_const()->make_buffer_b_direct_impl(n, k, scale_data);
+  }
+  // Default: not supported. FP4 derived class overrides.
+  std::shared_ptr<typename T::BufferB> make_buffer_b_direct_impl(size_t /*n*/, size_t /*k*/,
+                                                                 void* /*scale_data*/) const {
+    throw std::runtime_error("make_buffer_b_direct_impl not implemented for this MoE backend");
   }
   std::shared_ptr<typename T::BufferC> make_buffer_c(size_t m, size_t n, void* data) const {
     return derived_const()->make_buffer_c_impl(m, n, data);

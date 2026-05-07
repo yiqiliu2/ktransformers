@@ -1088,6 +1088,12 @@ struct BufferBInt4KGroupImpl {
     return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size);
   }
 
+  // Direct-pointer mode: only float32 scales are allocated; weight pointer is
+  // set externally to point at mmap'd safetensor data.
+  static size_t required_size_scale_only(int n, int k, int k_group_size) {
+    return sizeof(float) * n * (k / k_group_size);
+  }
+
   BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
     assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
     assert(n % N_STEP == 0);
@@ -1100,6 +1106,23 @@ struct BufferBInt4KGroupImpl {
     k_group_count = k / k_group_size;
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
+  }
+
+  // Direct-pointer constructor: b is left null; caller assigns it to point at
+  // mmap'd safetensor data after construction. Only `scale_ptr` (float32 scales)
+  // is required for owned storage.
+  BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* scale_ptr, std::nullptr_t /*direct*/)
+      : b(nullptr), n(n), k(k), k_group_size(k_group_size) {
+    assert(reinterpret_cast<intptr_t>(scale_ptr) % 64 == 0);
+    assert(n % N_STEP == 0);
+    assert(k % K_STEP == 0);
+    if (n % N_STEP || k % K_STEP || k % k_group_size) {
+      printf("BufferBInt4KGroupImpl(direct): n: %d, k: %d, N_STEP: %d, K_STEP: %d, k_group_size: %d\n", n, k, N_STEP,
+             K_STEP, k_group_size);
+      throw std::runtime_error("n or k is not aligned to N_STEP or K_STEP");
+    }
+    k_group_count = k / k_group_size;
+    d = reinterpret_cast<float*>(scale_ptr);
   }
 
   // Load from packed signed int4 format

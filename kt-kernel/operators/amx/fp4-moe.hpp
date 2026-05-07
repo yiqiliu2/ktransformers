@@ -14,6 +14,9 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <atomic>
+#include <cmath>
+
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -130,10 +133,13 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           const __m512bh a  = a_row[g];
-          const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32(w0[g]);
-          const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(w1[g]);
-          const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(w2[g]);
-          const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(w3[g]);
+          // KT-PATCH: use _mm_loadu_si128 for unaligned bb->b (mmap data_ptr from torch
+          // tensor isn't always 16-byte aligned; original code's implicit *p__m128i was
+          // emitted as aligned vmovdqa which SIGSEGV'd on misaligned mmap pointer).
+          const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w0 + g));
+          const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g));
+          const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g));
+          const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g));
           acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]),
                                  _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d0), acc0);
           acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]),
@@ -152,7 +158,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const __m512bh a = a_row[g];
-          const __m512bh d = (__m512bh)mxfp4_to_bf16_32(w[g]);
+          const __m512bh d = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g));
           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
                                 _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d), acc);
         }
@@ -198,10 +204,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           // 4 行权重解码一次, MB 个 token 共享
-          const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32(w0[g]);
-          const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(w1[g]);
-          const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(w2[g]);
-          const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(w3[g]);
+          // KT-PATCH: _mm_loadu for unaligned bb->b (see fp4_mat_vec_kgroup patch above).
+          const __m512bh d0 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w0 + g));
+          const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g));
+          const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g));
+          const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g));
           const __m512  sv0 = _mm512_set1_ps(s0[g]);
           const __m512  sv1 = _mm512_set1_ps(s1[g]);
           const __m512  sv2 = _mm512_set1_ps(s2[g]);
@@ -236,7 +243,7 @@ struct GemmKernel224MXFP4SmallKGroup {
             acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
                                   _mm512_dpbf16_ps(_mm512_setzero_ps(),
                                                    a_rows[i][g],
-                                                   (__m512bh)mxfp4_to_bf16_32(w[g])),
+                                                   (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g))),
                                   acc);
           }
           c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -262,13 +269,13 @@ struct GemmKernel224MXFP4SmallKGroup {
         for (int g = 0; g < kg_count; g++) {
           const __m512bh a = a_row[g];
           a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]),
-                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(w0[g])), a0);
+                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w0 + g))), a0);
           a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]),
-                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(w1[g])), a1);
+                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g))), a1);
           a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]),
-                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(w2[g])), a2);
+                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g))), a2);
           a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]),
-                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(w3[g])), a3);
+                               _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g))), a3);
         }
         reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
       }
@@ -280,7 +287,7 @@ struct GemmKernel224MXFP4SmallKGroup {
           acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
                                 _mm512_dpbf16_ps(_mm512_setzero_ps(),
                                                  a_row[g],
-                                                 (__m512bh)mxfp4_to_bf16_32(w[g])),
+                                                 (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g))),
                                 acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -354,6 +361,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
     return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data);
   }
+  // Direct-pointer ctor: scale_data owned, b set externally to mmap region.
+  std::shared_ptr<typename T::BufferB> make_buffer_b_direct_impl(size_t n, size_t k, void* scale_data) const {
+    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, scale_data, nullptr);
+  }
   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
     return std::make_shared<typename T::BufferC>(m, n, data);
   }
@@ -370,6 +381,29 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     } else {
       amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     }
+    // KT-NAN-CHECK: scan a few output rows for NaN/Inf to catch where compute breaks.
+    if (ith == 0) {
+      static std::atomic<int> nan_report_count{0};
+      auto bc_ptr = bc.get();
+      float* c_data = bc_ptr->get_submat(m, config_.intermediate_size, 0, 0);
+      int problems = 0;
+      int probe_n = std::min(64, config_.intermediate_size);
+      float first_v = 0.0f, last_v = 0.0f;
+      for (int i = 0; i < probe_n; i++) {
+        float v = c_data[i];
+        if (std::isnan(v) || std::isinf(v)) problems++;
+        if (i == 0) first_v = v;
+        if (i == probe_n - 1) last_v = v;
+      }
+      if (problems > 0 && nan_report_count.fetch_add(1) < 4) {
+        fprintf(stderr,
+                "[KT-NAN] do_gate_up layer=%d expert_idx=%d do_up=%d m=%d "
+                "first_n=%d/%d NaN-or-Inf, c[0]=%g c[%d]=%g\n",
+                config_.layer_idx, expert_idx, do_up ? 1 : 0, m,
+                problems, probe_n, first_v, probe_n - 1, last_v);
+        fflush(stderr);
+      }
+    }
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
@@ -383,6 +417,28 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     }
+    // KT-NAN-CHECK
+    if (ith == 0) {
+      static std::atomic<int> nan_report_count{0};
+      auto bc_ptr = down_bc_[expert_idx].get();
+      float* c_data = bc_ptr->get_submat(m, config_.hidden_size, 0, 0);
+      int problems = 0;
+      int probe_n = std::min(64, config_.hidden_size);
+      float first_v = 0.0f, last_v = 0.0f;
+      for (int i = 0; i < probe_n; i++) {
+        float v = c_data[i];
+        if (std::isnan(v) || std::isinf(v)) problems++;
+        if (i == 0) first_v = v;
+        if (i == probe_n - 1) last_v = v;
+      }
+      if (problems > 0 && nan_report_count.fetch_add(1) < 4) {
+        fprintf(stderr,
+                "[KT-NAN] do_down layer=%d expert_idx=%d m=%d first_n=%d/%d NaN-or-Inf, "
+                "c[0]=%g c[%d]=%g\n",
+                config_.layer_idx, expert_idx, m, problems, probe_n, first_v, probe_n - 1, last_v);
+        fflush(stderr);
+      }
+    }
   }
 
   void load_weights() {
@@ -392,51 +448,116 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     if (quant_config.group_size == 0 || quant_config.zero_point)
       throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
-    if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
 
+    // Two source modes for the FP4 weight bytes:
+    //   A) Packed mode: outer wrapper allocated tpc.gate_proj/up_proj/down_proj (one big
+    //      buffer per layer). Source ptr = config_.gate_proj + expert_id*stride.
+    //   B) Per-expert mode: outer wrapper passed config_.gate_projs (vector of per-expert
+    //      pointers, typically into the safetensor mmap). Source ptr = config_.gate_projs[0][expert_id].
+    // Per-expert mode lets us avoid the ~80 GB packed copy on consumer hardware (e.g. WSL2
+    // 88 GB RAM running V4-Flash 149 GB MXFP4); skip allocate+memcpy in the outer wrapper.
+    const bool use_per_expert_weights = !config_.gate_projs.empty();
+    if (!use_per_expert_weights && config_.gate_proj == nullptr)
+      throw std::runtime_error("MXFP4 MoE: need either gate_proj or gate_projs.");
+    // Scales path supports per-expert too (config_.gate_scales) for full mmap-only loads.
+    const bool use_per_expert_scales = !config_.gate_scales.empty();
+    if (!use_per_expert_scales && config_.gate_scale == nullptr)
+      throw std::runtime_error("MXFP4 MoE: need either gate_scale or gate_scales.");
+
+    // True direct-pointer mode: bb->b points at safetensor mmap; only scales are
+    // converted into our owned scale buffer (allocated by AMX_MOE_BASE::init).
+    // No per-expert weight memcpy → 127 GB heap is gone.
+    if (config_.kt_direct_pointer) {
+      if (!use_per_expert_weights || !use_per_expert_scales)
+        throw std::runtime_error("kt_direct_pointer requires per-expert ptr + scale arrays.");
+      pool->do_work_stealing_job(
+          config_.expert_num, nullptr,
+          [this, physical_to_logical_map](int task_id) {
+            uint64_t expert_idx = task_id;
+            uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+            using dt = typename T::BufferB::dt;
+            // Set b to mmap pointer (read-only). Compute path only reads, so no faults.
+            gate_bb_[expert_idx]->b = (dt*)config_.gate_projs[0][logical_expert_id];
+            up_bb_[expert_idx]->b = (dt*)config_.up_projs[0][logical_expert_id];
+            down_bb_[expert_idx]->b = (dt*)config_.down_projs[0][logical_expert_id];
+            // Convert scales bf16 → fp32 into the owned scale buffer (bb->d).
+            size_t scale_elem_count =
+                (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
+            convert_or_copy(gate_bb_[expert_idx]->d,
+                            (ggml_bf16_t*)config_.gate_scales[0][logical_expert_id], scale_elem_count);
+            convert_or_copy(up_bb_[expert_idx]->d,
+                            (ggml_bf16_t*)config_.up_scales[0][logical_expert_id], scale_elem_count);
+            convert_or_copy(down_bb_[expert_idx]->d,
+                            (ggml_bf16_t*)config_.down_scales[0][logical_expert_id], scale_elem_count);
+          },
+          nullptr);
+      return;
+    }
+
+    // Memcpy from source into bb->b (which was full-size aligned_alloc'd in moe_base.hpp).
+    // Source is per-expert pointers (mmap-backed safetensor data) when use_per_expert_weights,
+    // or the packed config_.gate_proj allocation otherwise.
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical_map](int task_id) {
+        [this, nth, physical_to_logical_map, use_per_expert_weights](int task_id) {
           uint64_t expert_idx = task_id / nth;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
-          gate_bb_[expert_idx]->from_raw_mat(
-              (uint8_t*)config_.gate_proj +
-                  ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
-              ith, nth);
-          up_bb_[expert_idx]->from_raw_mat(
-              (uint8_t*)config_.up_proj + ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
-              ith, nth);
+          uint8_t* gate_src;
+          uint8_t* up_src;
+          if (use_per_expert_weights) {
+            gate_src = (uint8_t*)config_.gate_projs[0][logical_expert_id];
+            up_src = (uint8_t*)config_.up_projs[0][logical_expert_id];
+          } else {
+            const size_t off = (logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1;
+            gate_src = (uint8_t*)config_.gate_proj + off;
+            up_src = (uint8_t*)config_.up_proj + off;
+          }
+          gate_bb_[expert_idx]->from_raw_mat(gate_src, ith, nth);
+          up_bb_[expert_idx]->from_raw_mat(up_src, ith, nth);
         },
         nullptr);
 
     nth = T::recommended_nth(config_.hidden_size);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical_map](int task_id) {
+        [this, nth, physical_to_logical_map, use_per_expert_weights](int task_id) {
           uint64_t expert_idx = task_id / nth;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
-          down_bb_[expert_idx]->from_raw_mat(
-              (uint8_t*)config_.down_proj +
-                  ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
-              ith, nth);
+          uint8_t* down_src;
+          if (use_per_expert_weights) {
+            down_src = (uint8_t*)config_.down_projs[0][logical_expert_id];
+          } else {
+            down_src = (uint8_t*)config_.down_proj +
+                       ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1);
+          }
+          down_bb_[expert_idx]->from_raw_mat(down_src, ith, nth);
         },
         nullptr);
 
     pool->do_work_stealing_job(
         config_.expert_num, nullptr,
-        [this, physical_to_logical_map](int task_id) {
+        [this, physical_to_logical_map, use_per_expert_scales](int task_id) {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          convert_or_copy(gate_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(up_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(down_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          ggml_bf16_t* gate_s_src;
+          ggml_bf16_t* up_s_src;
+          ggml_bf16_t* down_s_src;
+          if (use_per_expert_scales) {
+            gate_s_src = (ggml_bf16_t*)config_.gate_scales[0][logical_expert_id];
+            up_s_src = (ggml_bf16_t*)config_.up_scales[0][logical_expert_id];
+            down_s_src = (ggml_bf16_t*)config_.down_scales[0][logical_expert_id];
+          } else {
+            gate_s_src = (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count);
+            up_s_src = (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count);
+            down_s_src = (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count);
+          }
+          convert_or_copy(gate_bb_[expert_idx]->d, gate_s_src, scale_elem_count);
+          convert_or_copy(up_bb_[expert_idx]->d, up_s_src, scale_elem_count);
+          convert_or_copy(down_bb_[expert_idx]->d, down_s_src, scale_elem_count);
         },
         nullptr);
   }
@@ -660,6 +781,30 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       auto& tpc = tps[i]->config_;
       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
       size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
+
+      // Direct-pointer mode for per-expert input (TP=1 only): forward the per-expert
+      // mmap pointer arrays through to the inner load_weights(); skip the ~80 GB packed
+      // allocation + memcpy. The inner AMX_FP4_MOE_TP::load_weights consumes
+      // config_.gate_projs[0][expert] directly when use_per_expert_weights is true.
+      // Saves on consumer hardware (e.g. WSL2 88 GB host running V4-Flash 149 GB MXFP4).
+      // Falls back to the packed path for tp_count > 1 because the down-proj
+      // memcpy splits along intermediate_size, which has no per-expert equivalent.
+      const bool kt_direct_per_expert = use_per_expert_ptrs && tp_count == 1;
+      if (kt_direct_per_expert) {
+        tpc.gate_projs = config.gate_projs;
+        tpc.up_projs = config.up_projs;
+        tpc.down_projs = config.down_projs;
+        tpc.gate_scales = config.gate_scales;
+        tpc.up_scales = config.up_scales;
+        tpc.down_scales = config.down_scales;
+        tpc.gate_proj = nullptr;
+        tpc.up_proj = nullptr;
+        tpc.down_proj = nullptr;
+        tpc.gate_scale = nullptr;
+        tpc.up_scale = nullptr;
+        tpc.down_scale = nullptr;
+        return;  // skip the alloc+memcpy below; inner load_weights uses tpc.*_projs[0][exp]
+      }
 
       tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
       tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];

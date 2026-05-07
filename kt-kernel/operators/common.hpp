@@ -297,6 +297,13 @@ struct GeneralMOEConfig {
   bool share_backward_bb = false;
   bool share_cache_pool = false;
 
+  // FP4 direct-pointer mode: weights stay in safetensor mmap; per-expert weight
+  // heap is replaced by scale-only allocation. Cuts ~127 GB to ~8 GB for V4-Flash
+  // on consumer hardware. Requires tp_count == 1 and a BufferB type that exposes
+  // required_size_scale_only (currently BufferBInt4KGroupImpl only). Set from
+  // Python when use_per_expert_ptrs && tp_count == 1.
+  bool kt_direct_pointer = false;
+
   // for llamafile
   int m_block = 4;
   int group_min_len = 0;

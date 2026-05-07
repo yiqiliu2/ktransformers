@@ -26,14 +26,22 @@
 // #define PROFILE_BALANCE
 
 inline void set_to_numa(int this_numa) {
-  struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
+  // WSL2 / containers without NUMA: numa_available() returns -1 and
+  // numa_num_configured_nodes() / numa_bitmask_alloc() return invalid values,
+  // causing numa_bitmask_setbit to segfault. Skip pinning entirely.
+  if (numa_available() < 0) return;
+  int n = numa_num_configured_nodes();
+  if (n <= 0) return;
+  struct bitmask* mask = numa_bitmask_alloc(n);
+  if (!mask) return;
   numa_bitmask_setbit(mask, this_numa);
   numa_bind(mask);
   numa_bitmask_free(mask);
 }
 
 inline void set_memory_to_numa(int this_numa) {
-  // printf("Set memory to NUMA %d\n", this_numa);
+  // Skip when NUMA not available (e.g. WSL2)
+  if (numa_available() < 0) return;
   hwloc_topology_t topology;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);

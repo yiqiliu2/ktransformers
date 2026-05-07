@@ -748,6 +748,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("load", &GeneralMOEConfig::load)
       .def_readwrite("share_backward_bb", &GeneralMOEConfig::share_backward_bb)
       .def_readwrite("share_cache_pool", &GeneralMOEConfig::share_cache_pool)
+      .def_readwrite("kt_direct_pointer", &GeneralMOEConfig::kt_direct_pointer)
       .def_readwrite("m_block", &GeneralMOEConfig::m_block)
       .def_readwrite("group_min_len", &GeneralMOEConfig::group_min_len)
       .def_readwrite("group_max_len", &GeneralMOEConfig::group_max_len)
