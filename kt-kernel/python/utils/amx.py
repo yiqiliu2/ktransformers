@@ -535,7 +535,18 @@ class NativeMoEWrapper(BaseMoEWrapper):
             elif method == "GPTQ_INT4":
                 NativeMoEWrapper._native_loader_instance = GPTQSafeTensorLoader(weight_path)
             elif method == "MXFP4":
-                NativeMoEWrapper._native_loader_instance = MXFP4SafeTensorLoader(weight_path)
+                # yiqiliu2 / 2026-05-07: prefer the per-expert packed blob
+                # (built by ~/.local/bin/dsv4-pack-experts.py) when available
+                # — it's a single SSD-friendly file with layer-major
+                # contiguous expert layout. Set KT_MXFP4_PACKED_DIR=<dir> to
+                # opt in. Falls back to the safetensors loader otherwise.
+                packed_dir = os.environ.get("KT_MXFP4_PACKED_DIR")
+                if packed_dir:
+                    from kt_kernel.utils.loader import MXFP4PackedLoader
+                    print(f"[NativeMoEWrapper] MXFP4 packed-loader path: {packed_dir}")
+                    NativeMoEWrapper._native_loader_instance = MXFP4PackedLoader(packed_dir)
+                else:
+                    NativeMoEWrapper._native_loader_instance = MXFP4SafeTensorLoader(weight_path)
             else:
                 raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
         self.loader = NativeMoEWrapper._native_loader_instance

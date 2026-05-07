@@ -8,7 +8,9 @@ This module provides loaders for:
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import numpy as np
 import torch
 from enum import IntEnum
@@ -1319,3 +1321,207 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
             "up_scale": up_scales,
             "down_scale": down_scales,
         }
+
+
+class MXFP4PackedLoader:
+    """V4-Flash MXFP4 expert loader backed by a single packed blob produced by
+    `~/.local/bin/dsv4-pack-experts.py`.
+
+    Disk layout: one ``experts.bin`` of contiguous bytes, with one
+    ``experts.idx.json`` mapping ``"L.E.proj"`` to byte offsets and shapes.
+    Each (layer, expert, proj) entry stores ``[weight_bytes][scale_bytes]``
+    so weight and scale of one projection sit next to each other on SSD.
+    Layout order: layer-major, expert, then proj in (w1, w3, w2).
+
+    Why: the safetensors-backed MXFP4SafeTensorLoader scatters expert reads
+    across 46 shards, each with safetensors metadata at its head. Demand-
+    paging during decode pulls one (small) byte range per expert across many
+    shard files, defeating SSD readahead. The packed blob reduces the
+    expert-bytes path to a single file with predictable layer-contiguous
+    layout, making both kernel-driven faults and explicit MADV_WILLNEED
+    prefetch much cheaper.
+
+    Compatibility: returns the same dict shape as
+    MXFP4SafeTensorLoader.load_experts so it slots into NativeMoEWrapper.
+
+    Origin: yiqiliu2 V4-Flash perf, 2026-05-07.
+    """
+
+    PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down) — same as MXFP4SafeTensorLoader
+
+    def __init__(self, packed_dir: str):
+        bin_path = os.path.join(packed_dir, "experts.bin")
+        idx_path = os.path.join(packed_dir, "experts.idx.json")
+        if not os.path.isfile(bin_path):
+            raise FileNotFoundError(f"experts.bin missing at {bin_path}")
+        if not os.path.isfile(idx_path):
+            raise FileNotFoundError(f"experts.idx.json missing at {idx_path}")
+        with open(idx_path) as f:
+            self.index = json.load(f)
+        if self.index.get("format_version") != 1:
+            raise ValueError(f"unsupported pack format_version={self.index.get('format_version')}")
+        self.bin_path = bin_path
+        # MAP_PRIVATE read-only mmap; np.memmap defaults to mode='r'
+        self.mm = np.memmap(bin_path, dtype=np.uint8, mode="r")
+        # Hint the kernel: random access pattern (don't try to read-ahead 128
+        # KB on every fault — we want per-expert granularity not whole-shard
+        # streaming). Per-(layer, expert) MADV_WILLNEED is issued on demand
+        # via prefetch_experts() during prefill. We deliberately do NOT
+        # WILLNEED the whole 137 GB blob at startup — that overflows the
+        # 88 GB host budget on this rig (kernel pulls more than it can keep,
+        # other processes get OOM-killed).
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            MADV_RANDOM = 1  # Linux value
+            libc.madvise(ctypes.c_void_p(self.mm.ctypes.data),
+                         ctypes.c_size_t(self.mm.nbytes),
+                         ctypes.c_int(MADV_RANDOM))
+            self._libc = libc
+        except Exception:
+            self._libc = None
+
+        self.layer_count = int(self.index.get("layer_count", 0))
+        self.expert_count = int(self.index.get("expert_count", 0))
+
+    # API parity with MXFP4SafeTensorLoader (the only methods used by the kt-kernel path).
+    def has_tensor(self, name: str) -> bool:
+        # Best-effort emulation: parse "..layers.{L}.ffn.experts.{E}.{proj}.weight" or .scale
+        m = MXFP4PackedLoader._FALLBACK_KEY_RE.match(name)
+        if not m:
+            return False
+        return f"{m.group('L')}.{m.group('E')}.{m.group('proj')}" in self.index["experts"]
+
+    _FALLBACK_KEY_RE = re.compile(
+        r"^(?:model\.)?layers\.(?P<L>\d+)\.ffn\.experts\.(?P<E>\d+)\.(?P<proj>w[123])\.(?:weight|scale)$"
+    )
+
+    @staticmethod
+    def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+        # Same logic as MXFP4SafeTensorLoader._ue8m0_to_bf16 — see that for derivation.
+        if scale_t.dtype != torch.uint8:
+            scale_t = scale_t.view(torch.uint8)
+        return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+
+    def _slice_bytes(self, offset: int, length: int) -> np.ndarray:
+        return self.mm[offset:offset + length]
+
+    def _torch_view(self, raw: np.ndarray, shape, dtype_str: str) -> torch.Tensor:
+        """Create a torch tensor that aliases the mmap region (zero-copy).
+
+        For uint8 we return a uint8 tensor of the right shape; the C++
+        consumer reinterprets via the same channel as MXFP4SafeTensorLoader.
+        """
+        # np -> torch zero-copy. The torch tensor borrows the mmap memory;
+        # downstream Phase A direct-pointer code calls .data_ptr() which
+        # then resolves to the mmap address. Tensor must be contiguous to
+        # match the C++ expectation.
+        t = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+        if dtype_str == "uint8":
+            pass  # raw bytes
+        else:
+            raise NotImplementedError(f"dtype {dtype_str} not handled")
+        t = t.view(*shape).contiguous()
+        return t
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        m = re.match(r"^(?:model\.)?layers\.(?P<L>\d+)$", base_key)
+        if not m:
+            raise ValueError(f"unexpected base_key {base_key!r}; expected layers.{{N}}")
+        L = int(m.group("L"))
+
+        # Discover expert count for this layer from the index
+        E = 0
+        while f"{L}.{E}.w1" in self.index["experts"]:
+            E += 1
+        if E == 0:
+            raise ValueError(f"no experts in pack for layer {L}")
+
+        out = {
+            "gate": [None] * E,        # w1 weight
+            "up": [None] * E,          # w3 weight
+            "down": [None] * E,        # w2 weight
+            "gate_scale": [None] * E,  # w1 scale, returned as bf16 for AMX compat
+            "up_scale": [None] * E,    # w3 scale
+            "down_scale": [None] * E,  # w2 scale
+        }
+        proj_to_dst = {
+            "w1": ("gate", "gate_scale"),
+            "w3": ("up", "up_scale"),
+            "w2": ("down", "down_scale"),
+        }
+        for e in range(E):
+            for proj in self.PROJ_NAMES:
+                rec = self.index["experts"].get(f"{L}.{e}.{proj}")
+                if rec is None:
+                    raise KeyError(f"missing entry for L={L} E={e} proj={proj}")
+                w_raw = self._slice_bytes(rec["w_off"], rec["w_len"])
+                s_raw = self._slice_bytes(rec["s_off"], rec["s_len"])
+                w_t = self._torch_view(w_raw, rec["w_shape"], rec["w_dtype"])
+                s_raw_t = self._torch_view(s_raw, rec["s_shape"], rec["s_dtype"])
+                # Promote ue8m0 → bf16 to keep AMX kernel ABI stable for now.
+                # (P3 in the perf roadmap will defer this to inline kernel
+                # dequant; for the first packed-loader iteration we keep the
+                # legacy bf16 scale layout so we touch fewer surfaces in one
+                # change set.)
+                s_bf16 = self._ue8m0_to_bf16(s_raw_t)
+                w_dst, s_dst = proj_to_dst[proj]
+                out[w_dst][e] = w_t
+                out[s_dst][e] = s_bf16
+        print(f"[MXFP4PackedLoader] Loaded {E} experts for layer {L} from {self.bin_path}")
+        return out
+
+    def prefetch_experts(self, layer: int, expert_ids):
+        """Background-friendly hint to the kernel: pre-read these experts'
+        byte ranges from SSD into the page cache. Used by the prefill cache
+        warming path (P4) — call this with the union of routed experts after
+        the gating output for a forward pass, BEFORE the AMX MoE kernel runs.
+        ``MADV_WILLNEED`` is asynchronous: the syscall returns immediately
+        and the kernel issues readahead in parallel with our compute.
+
+        ``expert_ids`` is an iterable of ints. We coalesce into the smallest
+        set of contiguous byte ranges and issue one madvise per range to
+        keep syscall overhead low.
+        """
+        if self._libc is None:
+            return
+        # Collect (off, end) pairs for w1/w3/w2 weight+scale of each expert
+        ranges = []
+        for e in expert_ids:
+            for proj in self.PROJ_NAMES:
+                rec = self.index["experts"].get(f"{layer}.{int(e)}.{proj}")
+                if rec is None:
+                    continue
+                # weight_off + weight_len, then scale_off + scale_len.
+                # We packed [w_bytes][s_bytes] contiguously, so a single
+                # range covers both.
+                ranges.append((rec["w_off"], rec["s_off"] + rec["s_len"]))
+        if not ranges:
+            return
+        ranges.sort()
+        # Coalesce contiguous / overlapping ranges (allows neighbor experts
+        # of the same layer to merge into a single syscall).
+        merged = [ranges[0]]
+        for start, end in ranges[1:]:
+            cur_s, cur_e = merged[-1]
+            if start <= cur_e + 65536:  # within 64 KB → coalesce, kernel readahead handles small gaps
+                merged[-1] = (cur_s, max(cur_e, end))
+            else:
+                merged.append((start, end))
+        import ctypes as _ctypes
+        MADV_WILLNEED = 3
+        base = self.mm.ctypes.data
+        for s, e in merged:
+            length = e - s
+            if length <= 0:
+                continue
+            self._libc.madvise(_ctypes.c_void_p(base + s),
+                               _ctypes.c_size_t(length),
+                               _ctypes.c_int(MADV_WILLNEED))
+
+    # Compatibility: optional close
+    def close_all_handles(self):
+        try:
+            del self.mm
+        except Exception:
+            pass
