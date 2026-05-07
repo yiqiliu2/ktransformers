@@ -14,9 +14,6 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
-#include <atomic>
-#include <cmath>
-
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -381,29 +378,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     } else {
       amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     }
-    // KT-NAN-CHECK: scan a few output rows for NaN/Inf to catch where compute breaks.
-    if (ith == 0) {
-      static std::atomic<int> nan_report_count{0};
-      auto bc_ptr = bc.get();
-      float* c_data = bc_ptr->get_submat(m, config_.intermediate_size, 0, 0);
-      int problems = 0;
-      int probe_n = std::min(64, config_.intermediate_size);
-      float first_v = 0.0f, last_v = 0.0f;
-      for (int i = 0; i < probe_n; i++) {
-        float v = c_data[i];
-        if (std::isnan(v) || std::isinf(v)) problems++;
-        if (i == 0) first_v = v;
-        if (i == probe_n - 1) last_v = v;
-      }
-      if (problems > 0 && nan_report_count.fetch_add(1) < 4) {
-        fprintf(stderr,
-                "[KT-NAN] do_gate_up layer=%d expert_idx=%d do_up=%d m=%d "
-                "first_n=%d/%d NaN-or-Inf, c[0]=%g c[%d]=%g\n",
-                config_.layer_idx, expert_idx, do_up ? 1 : 0, m,
-                problems, probe_n, first_v, probe_n - 1, last_v);
-        fflush(stderr);
-      }
-    }
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
@@ -416,28 +390,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     } else {
       amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
-    }
-    // KT-NAN-CHECK
-    if (ith == 0) {
-      static std::atomic<int> nan_report_count{0};
-      auto bc_ptr = down_bc_[expert_idx].get();
-      float* c_data = bc_ptr->get_submat(m, config_.hidden_size, 0, 0);
-      int problems = 0;
-      int probe_n = std::min(64, config_.hidden_size);
-      float first_v = 0.0f, last_v = 0.0f;
-      for (int i = 0; i < probe_n; i++) {
-        float v = c_data[i];
-        if (std::isnan(v) || std::isinf(v)) problems++;
-        if (i == 0) first_v = v;
-        if (i == probe_n - 1) last_v = v;
-      }
-      if (problems > 0 && nan_report_count.fetch_add(1) < 4) {
-        fprintf(stderr,
-                "[KT-NAN] do_down layer=%d expert_idx=%d m=%d first_n=%d/%d NaN-or-Inf, "
-                "c[0]=%g c[%d]=%g\n",
-                config_.layer_idx, expert_idx, m, problems, probe_n, first_v, probe_n - 1, last_v);
-        fflush(stderr);
-      }
     }
   }
 
