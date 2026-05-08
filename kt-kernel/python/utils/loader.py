@@ -1380,8 +1380,65 @@ class MXFP4PackedLoader:
         except Exception:
             self._libc = None
 
+        # yiqiliu2 / 2026-05-08: parallel pread() prefetch path. mmap-fault
+        # bw is capped by per-VMA semaphore (~222 MB/s for 16 concurrent
+        # threads on this WSL2 + Gen4 NVMe rig). Direct pread on the raw fd
+        # populates the same shared page cache without taking the VMA lock,
+        # so the AMX kernel's later mmap reads hit warm cache.
+        try:
+            self._raw_fd = os.open(bin_path, os.O_RDONLY)
+        except Exception:
+            self._raw_fd = -1
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = int(os.environ.get("KT_PREFETCH_WORKERS", "8"))
+            self._prefetch_pool = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="kt-prefetch"
+            )
+        except Exception:
+            self._prefetch_pool = None
+
         self.layer_count = int(self.index.get("layer_count", 0))
         self.expert_count = int(self.index.get("expert_count", 0))
+
+        # yiqiliu2 / 2026-05-08: mlock the first N GB of the packed blob
+        # (layer-major contiguous → covers experts of layers 0..K).
+        # Without this, OS LRU evicts hot expert pages under cache pressure
+        # and we burn SSD bw re-faulting experts. mlock guarantees no eviction.
+        # Default: 10 GB (RLIMIT_MEMLOCK is 11.8 GB on this host without sudo).
+        # Set KT_MLOCK_GB=0 to disable. Set higher if RLIMIT_MEMLOCK is raised.
+        try:
+            mlock_gb = float(os.environ.get("KT_MLOCK_GB", "11"))
+        except Exception:
+            mlock_gb = 0.0
+        # File-flag fallback because env vars get stripped on spawn.
+        if mlock_gb <= 0 and os.path.exists("/tmp/kt_mlock_gb"):
+            try:
+                with open("/tmp/kt_mlock_gb") as _f:
+                    mlock_gb = float(_f.read().strip())
+            except Exception:
+                pass
+        if mlock_gb > 0 and self._libc is not None:
+            mlock_bytes = int(mlock_gb * 1024 * 1024 * 1024)
+            mlock_bytes = min(mlock_bytes, len(self.mm))
+            try:
+                import ctypes as _c
+                base_addr = self.mm.ctypes.data
+                rc = self._libc.mlock(
+                    _c.c_void_p(base_addr), _c.c_size_t(mlock_bytes)
+                )
+                if rc == 0:
+                    print(f"[MXFP4PackedLoader] mlock'd {mlock_gb:.1f} GB of "
+                          f"experts.bin (offset 0..{mlock_bytes/1e9:.1f} GB) — "
+                          f"these pages will not evict.", flush=True)
+                else:
+                    err = ctypes.get_errno()
+                    print(f"[MXFP4PackedLoader] mlock {mlock_gb:.1f} GB FAILED "
+                          f"errno={err} ({os.strerror(err)}). "
+                          f"RLIMIT_MEMLOCK may be too low.", flush=True)
+            except Exception as e:
+                print(f"[MXFP4PackedLoader] mlock failed with exception: {e}",
+                      flush=True)
 
     # API parity with MXFP4SafeTensorLoader (the only methods used by the kt-kernel path).
     def has_tensor(self, name: str) -> bool:
@@ -1479,52 +1536,66 @@ class MXFP4PackedLoader:
         return out
 
     def prefetch_experts(self, layer: int, expert_ids):
-        """Background-friendly hint to the kernel: pre-read these experts'
-        byte ranges from SSD into the page cache. Used by the prefill cache
-        warming path (P4) — call this with the union of routed experts after
-        the gating output for a forward pass, BEFORE the AMX MoE kernel runs.
-        ``MADV_WILLNEED`` is asynchronous: the syscall returns immediately
-        and the kernel issues readahead in parallel with our compute.
+        """Pre-read the routed-expert byte ranges into the OS page cache via
+        parallel ``pread()`` on the raw fd. Bypasses Linux's per-VMA fault
+        serialisation: 16-thread mmap touch peaks at ~222 MB/s; direct dd
+        at 2.1 GB/s; so pread is the correct tool for "warm the cache fast".
+        Same inode shared with the mmap → AMX kernel's later mmap accesses
+        hit the cache at memory speed instead of stalling on faults.
 
-        ``expert_ids`` is an iterable of ints. We coalesce into the smallest
-        set of contiguous byte ranges and issue one madvise per range to
-        keep syscall overhead low.
+        Best-effort: if the prefetch pool isn't initialised (init failed)
+        or the raw fd is closed, silently no-op.
+        yiqiliu2 / 2026-05-08.
         """
-        if self._libc is None:
+        if not hasattr(self, "_prefetch_pool") or self._prefetch_pool is None:
             return
-        # Collect (off, end) pairs for w1/w3/w2 weight+scale of each expert
+        if not hasattr(self, "_raw_fd") or self._raw_fd < 0:
+            return
+        # Collect (off, len) pairs for w1/w3/w2 weight+scale of each expert
         ranges = []
         for e in expert_ids:
             for proj in self.PROJ_NAMES:
                 rec = self.index["experts"].get(f"{layer}.{int(e)}.{proj}")
                 if rec is None:
                     continue
-                # weight_off + weight_len, then scale_off + scale_len.
-                # We packed [w_bytes][s_bytes] contiguously, so a single
-                # range covers both.
+                # weight + scale are packed contiguously
                 ranges.append((rec["w_off"], rec["s_off"] + rec["s_len"]))
         if not ranges:
             return
         ranges.sort()
-        # Coalesce contiguous / overlapping ranges (allows neighbor experts
-        # of the same layer to merge into a single syscall).
-        merged = [ranges[0]]
+        # Coalesce neighbouring ranges (within 256 KB) so each pread is a
+        # bigger contiguous read — NVMe loves big sequential I/O.
+        merged = [list(ranges[0])]
         for start, end in ranges[1:]:
-            cur_s, cur_e = merged[-1]
-            if start <= cur_e + 65536:  # within 64 KB → coalesce, kernel readahead handles small gaps
-                merged[-1] = (cur_s, max(cur_e, end))
+            if start <= merged[-1][1] + 262144:
+                if end > merged[-1][1]:
+                    merged[-1][1] = end
             else:
-                merged.append((start, end))
-        import ctypes as _ctypes
-        MADV_WILLNEED = 3
-        base = self.mm.ctypes.data
+                merged.append([start, end])
+
+        fd = self._raw_fd
+
+        def _pread_chunk(off: int, length: int) -> None:
+            # 1 MB sub-chunks to interleave with other workers — pread
+            # releases the GIL so other threads can run.
+            CHUNK = 1024 * 1024
+            pos = off
+            remaining = length
+            while remaining > 0:
+                n = min(CHUNK, remaining)
+                _ = os.pread(fd, n, pos)
+                pos += n
+                remaining -= n
+
+        # Fire and forget — racing against GPU's parallel attn + dense MLP.
         for s, e in merged:
             length = e - s
             if length <= 0:
                 continue
-            self._libc.madvise(_ctypes.c_void_p(base + s),
-                               _ctypes.c_size_t(length),
-                               _ctypes.c_int(MADV_WILLNEED))
+            try:
+                self._prefetch_pool.submit(_pread_chunk, s, length)
+            except Exception:
+                pass
 
     # Compatibility: optional close
     def close_all_handles(self):
