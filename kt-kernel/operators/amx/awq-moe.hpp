@@ -271,7 +271,9 @@ class AMX_AWQ_MOE_TP : public AMX_MOE_BASE<T, AMX_AWQ_MOE_TP<T>> {
           break;
         }
       }
-      assert(0);
+      // yiqiliu2 / 2026-05-08: C2 — surface BB verification mismatch as
+      // an exception instead of NDEBUG-silent assert(0).
+      ASSERT_RELEASE(false, "AWQ MoE BB verification failed: bytewise mismatch (see printed bytes above)");
     } else {
       printf("pass verify\n");
       printf("numa %d, verify_bb_%d:\n", tp_part_idx, compare_expers);
@@ -587,7 +589,10 @@ class AMX_AWQ_MOE_TP : public AMX_MOE_BASE<T, AMX_AWQ_MOE_TP<T>> {
       }
       else {
         // Online Quantization from BF16
-        assert(config_.gate_proj != nullptr);
+        // yiqiliu2 / 2026-05-08: C2 — null projection in online quant path
+        // would deref garbage; surface as exception.
+        ASSERT_RELEASE(config_.gate_proj != nullptr,
+                       "AWQ MoE online-quant: config_.gate_proj is null");
 
         pool->do_work_stealing_job(
             nth * config_.expert_num, nullptr,

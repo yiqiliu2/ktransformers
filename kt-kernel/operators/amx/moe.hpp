@@ -108,7 +108,11 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
           break;  // find the first difference and exit
         }
       }
-      assert(0);
+      // yiqiliu2 / 2026-05-08: C2 — convert NDEBUG-silent assert(0) to
+      // release runtime check. AMX MoE BB verification mismatch is a
+      // critical correctness bug; surfacing it via exception is much
+      // better than the original silent UB in release builds.
+      ASSERT_RELEASE(false, "AMX MoE BB verification failed: bytewise mismatch (see printed bytes above)");
     } else {
       printf("pass verify\n");
       // pick out the 100th~150th byte of scale to see

@@ -214,7 +214,10 @@ struct BufferBFP8Impl {
    * @param d_src FP32 scale_inv 源数据 (n-major, ceil(n/128)×ceil(k/128))
    */
   void from_mat(const uint8_t* b_src, const float* d_src, int ith, int nth) {
-    assert(b != nullptr && d != nullptr);
+    // yiqiliu2 / 2026-05-08: C2 — null b/d in from_mat/to_mat would
+    // null-deref the destination loop; surface as exception.
+    ASSERT_RELEASE(b != nullptr && d != nullptr,
+                   "AMX raw buffer from_mat/to_mat: b or d is null");
     assert(N_STEP == 32 && K_STEP == 32);  // from mat block copy assumes this
 
     // Copy scales (per 128x128 block). Each thread copies its own n-block range.
@@ -297,7 +300,10 @@ struct BufferBFP8Impl {
    * @param nth Total number of threads
    */
   void to_mat(uint8_t* b_dst, float* d_dst, int ith, int nth) const {
-    assert(b != nullptr && d != nullptr);
+    // yiqiliu2 / 2026-05-08: C2 — null b/d in from_mat/to_mat would
+    // null-deref the destination loop; surface as exception.
+    ASSERT_RELEASE(b != nullptr && d != nullptr,
+                   "AMX raw buffer from_mat/to_mat: b or d is null");
     assert(N_STEP == 32 && K_STEP == 32);
 
     // Calculate N_BLOCK range for this thread
@@ -539,7 +545,10 @@ struct BufferBFP8PerChannelImpl {
    * @param d_src FP32 per-channel scale 源数据 (shape: [n] or [n, 1])
    */
   void from_mat(const uint8_t* b_src, const float* d_src, int ith, int nth) {
-    assert(b != nullptr && d != nullptr);
+    // yiqiliu2 / 2026-05-08: C2 — null b/d in from_mat/to_mat would
+    // null-deref the destination loop; surface as exception.
+    ASSERT_RELEASE(b != nullptr && d != nullptr,
+                   "AMX raw buffer from_mat/to_mat: b or d is null");
     assert(N_STEP == 32 && K_STEP == 32);
 
     // Copy per-channel scales. Each thread copies its own n-block range.

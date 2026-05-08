@@ -197,9 +197,11 @@ struct GemmKernel133 {
           vv[i] = copy8x64(offset_pointer(a, lda * i));
         }
       } else if constexpr (std::is_same_v<QA, blocks_aligned_q4_0_ref>) {
-        assert(0);
+        // yiqiliu2 / 2026-05-08: C2 — surface unimplemented template
+        // specialization as exception instead of NDEBUG-silent UB.
+        ASSERT_RELEASE(false, "partial_load_quant: blocks_aligned_q4_0_ref specialization not implemented");
       } else {
-        assert(0);
+        ASSERT_RELEASE(false, "partial_load_quant: unsupported QA type (only q8_0_ref / q4_0_ref expected)");
       }
     }
 
