@@ -363,12 +363,31 @@ class AMX_MOE_BASE {
       used_pool_bytes_bc_down += bc_down_size;
     }
 
+    // yiqiliu2 / 2026-05-08: P5.2 — pool-overflow runtime checks for the
+    // first forward variant (mirror of line 612 block). Same rationale:
+    // NDEBUG silently corrupts adjacent expert buffers; throw exception
+    // sglang scheduler can surface to client.
+    auto _kt_pool_check_v1 = [](size_t used, size_t cap, const char* name) {
+      if (used > cap) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "[kt-kernel] MoE pool overflow (forward v1): %s used=%zu cap=%zu",
+                      name, used, cap);
+        throw std::runtime_error(msg);
+      }
+    };
     assert(used_pool_m <= pool_count_);
     assert(used_pool_bytes_a <= gate_up_ba_pool_bytes_);
     assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
     assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
     assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
     assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
+    _kt_pool_check_v1(used_pool_m, pool_count_, "pool_count_");
+    _kt_pool_check_v1(used_pool_bytes_a, gate_up_ba_pool_bytes_, "gate_up_ba_pool_bytes_");
+    _kt_pool_check_v1(used_pool_bytes_bc_gate, gate_bc_pool_bytes_, "gate_bc_pool_bytes_");
+    _kt_pool_check_v1(used_pool_bytes_bc_up, up_bc_pool_bytes_, "up_bc_pool_bytes_");
+    _kt_pool_check_v1(used_pool_bytes_ba_down, down_ba_pool_bytes_, "down_ba_pool_bytes_");
+    _kt_pool_check_v1(used_pool_bytes_bc_down, down_bc_pool_bytes_, "down_bc_pool_bytes_");
 
 #ifdef FORWARD_TIME_PROFILE
     {
