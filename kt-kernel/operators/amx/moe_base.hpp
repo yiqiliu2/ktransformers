@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <utility>
@@ -600,11 +601,33 @@ class AMX_MOE_BASE {
       used_pool_bytes_ba_down += ba_down_size;
       used_pool_bytes_bc_down += bc_down_size;
     }
+    // yiqiliu2 / 2026-05-08: P5.2 — convert pool-overflow asserts to
+    // release-build runtime checks. With NDEBUG the assert() macros
+    // compile out, so a pool overflow silently corrupts the heap of
+    // an adjacent expert's buffer-C / buffer-A region. The C++ AMX
+    // path then writes wrong intermediates → garbage logits at the
+    // sampler. Keep the original assert (still useful for debug
+    // builds) but pair it with an unconditional check that throws
+    // an exception sglang's scheduler can surface to the client.
+    auto _kt_pool_check = [](size_t used, size_t cap, const char* name) {
+      if (used > cap) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "[kt-kernel] MoE pool overflow: %s used=%zu cap=%zu",
+                      name, used, cap);
+        throw std::runtime_error(msg);
+      }
+    };
     assert(used_pool_m <= pool_count_);
     assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
     assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
     assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
     assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
+    _kt_pool_check(used_pool_m, pool_count_, "pool_count_");
+    _kt_pool_check(used_pool_bytes_bc_gate, gate_bc_pool_bytes_, "gate_bc_pool_bytes_");
+    _kt_pool_check(used_pool_bytes_bc_up, up_bc_pool_bytes_, "up_bc_pool_bytes_");
+    _kt_pool_check(used_pool_bytes_ba_down, down_ba_pool_bytes_, "down_ba_pool_bytes_");
+    _kt_pool_check(used_pool_bytes_bc_down, down_bc_pool_bytes_, "down_bc_pool_bytes_");
 
     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
     for (int i = 0; i < activated_expert; i++) {
