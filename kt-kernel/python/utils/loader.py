@@ -1418,6 +1418,7 @@ class MXFP4PackedLoader:
                     mlock_gb = float(_f.read().strip())
             except Exception:
                 pass
+        mlock_bytes = 0
         if mlock_gb > 0 and self._libc is not None:
             mlock_bytes = int(mlock_gb * 1024 * 1024 * 1024)
             mlock_bytes = min(mlock_bytes, len(self.mm))
@@ -1438,6 +1439,60 @@ class MXFP4PackedLoader:
                           f"RLIMIT_MEMLOCK may be too low.", flush=True)
             except Exception as e:
                 print(f"[MXFP4PackedLoader] mlock failed with exception: {e}",
+                      flush=True)
+
+        # yiqiliu2 / 2026-05-08: parallel pread prewarm. mmap-fault path
+        # caps at ~600 MB/s buffered single-threaded on this WSL2 +
+        # Gen4 NVMe rig (3.4 GB/s direct dd, 3.3 GB/s 8-thread parallel
+        # pread). Prewarming the page cache via the existing prefetch
+        # pool lets later mmap reads hit warm cache instead of taking
+        # the per-VMA semaphore on each new page fault. Set
+        # KT_PREWARM_GB=N to prewarm N GB of the blob starting after
+        # the mlock'd region. With 88 GB RAM, sglang anon ~13 GB,
+        # mlock 8 GB, max useful prewarm is ~70 GB. Set =0 to skip.
+        try:
+            prewarm_gb = float(os.environ.get("KT_PREWARM_GB", "0"))
+        except Exception:
+            prewarm_gb = 0.0
+        if prewarm_gb <= 0 and os.path.exists("/tmp/kt_prewarm_gb"):
+            try:
+                with open("/tmp/kt_prewarm_gb") as _f:
+                    prewarm_gb = float(_f.read().strip())
+            except Exception:
+                pass
+        if (prewarm_gb > 0
+                and self._raw_fd >= 0
+                and self._prefetch_pool is not None):
+            import time as _time
+            blob_len = len(self.mm)
+            start_off = mlock_bytes
+            end_off = min(start_off + int(prewarm_gb * 1024**3), blob_len)
+            if end_off > start_off:
+                CHUNK = 4 * 1024 * 1024  # 4 MB
+                fd = self._raw_fd
+
+                def _prewarm_chunk(off, ln):
+                    return len(os.pread(fd, ln, off))
+
+                print(f"[MXFP4PackedLoader] prewarming "
+                      f"{(end_off-start_off)/1e9:.1f} GB "
+                      f"(offset {start_off/1e9:.1f}..{end_off/1e9:.1f} GB) "
+                      f"with {workers}-thread pread...", flush=True)
+                _t0 = _time.time()
+                futs = []
+                for _off in range(start_off, end_off, CHUNK):
+                    _ln = min(CHUNK, end_off - _off)
+                    futs.append(self._prefetch_pool.submit(_prewarm_chunk, _off, _ln))
+                _read = 0
+                for _f in futs:
+                    try:
+                        _read += _f.result()
+                    except Exception:
+                        pass
+                _el = _time.time() - _t0
+                print(f"[MXFP4PackedLoader] prewarm done: "
+                      f"{_read/1e9:.1f} GB in {_el:.1f}s "
+                      f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s",
                       flush=True)
 
     # API parity with MXFP4SafeTensorLoader (the only methods used by the kt-kernel path).
