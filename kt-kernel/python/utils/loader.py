@@ -1408,7 +1408,7 @@ class MXFP4PackedLoader:
         # Default: 10 GB (RLIMIT_MEMLOCK is 11.8 GB on this host without sudo).
         # Set KT_MLOCK_GB=0 to disable. Set higher if RLIMIT_MEMLOCK is raised.
         try:
-            mlock_gb = float(os.environ.get("KT_MLOCK_GB", "11"))
+            mlock_gb = float(os.environ.get("KT_MLOCK_GB", "8"))
         except Exception:
             mlock_gb = 0.0
         # File-flag fallback because env vars get stripped on spawn.
