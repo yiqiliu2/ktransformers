@@ -1363,21 +1363,20 @@ class MXFP4PackedLoader:
         self.bin_path = bin_path
         # MAP_PRIVATE read-only mmap; np.memmap defaults to mode='r'
         self.mm = np.memmap(bin_path, dtype=np.uint8, mode="r")
-        # Hint the kernel: random access pattern (don't try to read-ahead 128
-        # KB on every fault — we want per-expert granularity not whole-shard
-        # streaming). Per-(layer, expert) MADV_WILLNEED is issued on demand
-        # via prefetch_experts() during prefill. We deliberately do NOT
-        # WILLNEED the whole 137 GB blob at startup — that overflows the
-        # 88 GB host budget on this rig (kernel pulls more than it can keep,
-        # other processes get OOM-killed).
+        # Originally we set MADV_RANDOM here to "respect" the per-expert
+        # access pattern. That tanked SSD bandwidth: each expert read became
+        # a synchronous 4 KB page fault, and kernel readahead was disabled.
+        # Profiled at only ~100 MB/s read bw on Gen4 NVMe, ~30× off peak —
+        # because we have ~6 active experts × ~580 KB = ~3.5 MB per layer
+        # per token, but they're issued as 875 separate 4 KB faults instead
+        # of ~30 64-KB reads. With layer-major contiguous layout, default
+        # kernel readahead (~128 KB) actually buys us coalesced reads inside
+        # each layer's region without much waste. Keep `_libc` for explicit
+        # MADV_WILLNEED prefetch via `prefetch_experts()`.
+        # yiqiliu2 / 2026-05-08.
         try:
             import ctypes
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            MADV_RANDOM = 1  # Linux value
-            libc.madvise(ctypes.c_void_p(self.mm.ctypes.data),
-                         ctypes.c_size_t(self.mm.nbytes),
-                         ctypes.c_int(MADV_RANDOM))
-            self._libc = libc
+            self._libc = ctypes.CDLL("libc.so.6", use_errno=True)
         except Exception:
             self._libc = None
 
