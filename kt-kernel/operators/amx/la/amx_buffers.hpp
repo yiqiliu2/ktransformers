@@ -1077,6 +1077,13 @@ struct BufferBInt4KGroupImpl {
   using dt = typename K::dt;
   dt* b;     // packed signed int4 weights, col majored
   float* d;  // scales only (no mins/zero-points), row majored
+  // ue8m0 scale passthrough: when non-null, kernel reads 1-byte ue8m0 here
+  // (mmap'd from packed file) and expands to fp32 inline as `(s_u8 << 23) bitcast<f32>
+  // = 2^(s-127)`. This bypasses the 33 GB load-time fp32 scale heap (V4-Flash, 256
+  // experts × 43 layers × ~768 MB/layer). Set in direct mode by AMX_MOE_BASE ctor;
+  // when set, `d` stays nullptr and no aligned_alloc/convert_or_copy happens.
+  // yiqiliu2 / 2026-05-07.
+  uint8_t* d_u8 = nullptr;
   int n, k, k_group_size, k_group_count;
 
   static constexpr int N_STEP = K::N_STEP;
@@ -1152,6 +1159,13 @@ struct BufferBInt4KGroupImpl {
   float* get_scale(int n, int n_begin, int k, int k_begin) {
     int k_group_idx = k_begin / k_group_size;
     return d + n_begin * (k / k_group_size) + k_group_idx;
+  }
+
+  // Same indexing as get_scale, but for the ue8m0 1-byte scale stream. Caller
+  // expands to fp32 inline via `(uint32_t)s_u8 << 23` bitcast<f32>.
+  uint8_t* get_scale_u8(int n, int n_begin, int k, int k_begin) {
+    int k_group_idx = k_begin / k_group_size;
+    return d_u8 + n_begin * (k / k_group_size) + k_group_idx;
   }
 
   // Split range for parallel processing

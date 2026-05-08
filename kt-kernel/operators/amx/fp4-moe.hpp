@@ -52,6 +52,21 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,   //  0..7  positive
       0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};  //  8..15 negative
 
+  // Broadcast a single per-K-group scale into all 16 lanes of a __m512.
+  //   - Fast path (s_u8 != nullptr, the V4-Flash ue8m0 passthrough): read 1 byte ue8m0
+  //     and inline expand to fp32 via `(uint32_t)s_u8 << 23` reinterpret-as-fp32, which
+  //     yields 2^(s-127) — the exact ue8m0 value, lossless. Compute is identical to
+  //     the fp32 path; the win is 4× scale memory bandwidth (1 B vs 4 B per group).
+  //     This bypasses the ~33 GB load-time scale heap (V4-Flash, 256 experts × 43 layers).
+  //   - Legacy path (s_u8 == nullptr): broadcast pre-converted fp32 scale.
+  // The branch on s_u8 is hoist-able by the optimizer because s_u8/s_f32 are loop
+  // invariants in the K-group loop. yiqiliu2 / 2026-05-07.
+  __attribute__((always_inline)) static inline __m512
+  broadcast_scale(const float* s_f32, const uint8_t* s_u8, int g) {
+    return s_u8 ? _mm512_castsi512_ps(_mm512_set1_epi32(((int32_t)s_u8[g]) << 23))
+                : _mm512_set1_ps(s_f32[g]);
+  }
+
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
   __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
@@ -112,16 +127,23 @@ struct GemmKernel224MXFP4SmallKGroup {
       __m512bh* a_row = (__m512bh*)ba->get_submat(m, k, m_idx, 0);
 
       int n_pos = n_start;
+      // ue8m0 passthrough: when bb->d_u8 is set, all per-row get_scale_u8 calls are
+      // valid and bb->d is null; otherwise the fp32 path applies. Resolved per N-row.
+      const bool use_u8 = (bb->d_u8 != nullptr);
       // 主循环: N 维 4 行一组
       for (; n_pos + 4 <= n_end; n_pos += 4) {
         __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const float*   s0    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 0, k, 0);
+        const float*   s1    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 1, k, 0);
+        const float*   s2    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 2, k, 0);
+        const float*   s3    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 0, k, 0) : nullptr;
+        const uint8_t* s1_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 1, k, 0) : nullptr;
+        const uint8_t* s2_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 2, k, 0) : nullptr;
+        const uint8_t* s3_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 3, k, 0) : nullptr;
 
         __m512 acc0 = _mm512_setzero_ps();
         __m512 acc1 = _mm512_setzero_ps();
@@ -137,13 +159,13 @@ struct GemmKernel224MXFP4SmallKGroup {
           const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g));
           const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g));
           const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g));
-          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]),
+          acc0 = _mm512_fmadd_ps(broadcast_scale(s0, s0_u8, g),
                                  _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d0), acc0);
-          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]),
+          acc1 = _mm512_fmadd_ps(broadcast_scale(s1, s1_u8, g),
                                  _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d1), acc1);
-          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]),
+          acc2 = _mm512_fmadd_ps(broadcast_scale(s2, s2_u8, g),
                                  _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d2), acc2);
-          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]),
+          acc3 = _mm512_fmadd_ps(broadcast_scale(s3, s3_u8, g),
                                  _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d3), acc3);
         }
         reduce4(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start));
@@ -151,12 +173,13 @@ struct GemmKernel224MXFP4SmallKGroup {
       // N 尾巴: N % 4 != 0 时单行 fallback
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const float*   s    = use_u8 ? nullptr : bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s_u8 = use_u8 ? bb->get_scale_u8(n, n_pos, k, 0) : nullptr;
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const __m512bh a = a_row[g];
           const __m512bh d = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g));
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
+          acc = _mm512_fmadd_ps(broadcast_scale(s, s_u8, g),
                                 _mm512_dpbf16_ps(_mm512_setzero_ps(), a, d), acc);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
@@ -175,6 +198,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     constexpr int MB = 4;
     constexpr int NB = 4;
 
+    // ue8m0 passthrough flag for the entire mat-mat kernel call.
+    const bool use_u8 = (bb->d_u8 != nullptr);
     int m_pos = 0;
     for (; m_pos + MB <= m; m_pos += MB) {
       __m512bh* a_rows[MB] = {
@@ -190,10 +215,14 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const float*   s0    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 0, k, 0);
+        const float*   s1    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 1, k, 0);
+        const float*   s2    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 2, k, 0);
+        const float*   s3    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 0, k, 0) : nullptr;
+        const uint8_t* s1_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 1, k, 0) : nullptr;
+        const uint8_t* s2_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 2, k, 0) : nullptr;
+        const uint8_t* s3_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 3, k, 0) : nullptr;
 
         __m512 acc[MB][NB];
         for (int i = 0; i < MB; i++)
@@ -206,10 +235,10 @@ struct GemmKernel224MXFP4SmallKGroup {
           const __m512bh d1 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g));
           const __m512bh d2 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g));
           const __m512bh d3 = (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g));
-          const __m512  sv0 = _mm512_set1_ps(s0[g]);
-          const __m512  sv1 = _mm512_set1_ps(s1[g]);
-          const __m512  sv2 = _mm512_set1_ps(s2[g]);
-          const __m512  sv3 = _mm512_set1_ps(s3[g]);
+          const __m512  sv0 = broadcast_scale(s0, s0_u8, g);
+          const __m512  sv1 = broadcast_scale(s1, s1_u8, g);
+          const __m512  sv2 = broadcast_scale(s2, s2_u8, g);
+          const __m512  sv3 = broadcast_scale(s3, s3_u8, g);
 
           #define V_FMA_ROW(M_I) do { \
               const __m512bh a = a_rows[M_I][g]; \
@@ -232,12 +261,13 @@ struct GemmKernel224MXFP4SmallKGroup {
       // N 尾巴: 单 N 列 × MB token (V4 不触发)
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const float*   s    = use_u8 ? nullptr : bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s_u8 = use_u8 ? bb->get_scale_u8(n, n_pos, k, 0) : nullptr;
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
-            acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
+            acc = _mm512_fmadd_ps(broadcast_scale(s, s_u8, g),
                                   _mm512_dpbf16_ps(_mm512_setzero_ps(),
                                                    a_rows[i][g],
                                                    (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g))),
@@ -257,31 +287,36 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const float*   s0    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 0, k, 0);
+        const float*   s1    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 1, k, 0);
+        const float*   s2    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 2, k, 0);
+        const float*   s3    = use_u8 ? nullptr : bb->get_scale(n, n_pos + 3, k, 0);
+        const uint8_t* s0_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 0, k, 0) : nullptr;
+        const uint8_t* s1_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 1, k, 0) : nullptr;
+        const uint8_t* s2_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 2, k, 0) : nullptr;
+        const uint8_t* s3_u8 = use_u8 ? bb->get_scale_u8(n, n_pos + 3, k, 0) : nullptr;
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(),
                a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const __m512bh a = a_row[g];
-          a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]),
+          a0 = _mm512_fmadd_ps(broadcast_scale(s0, s0_u8, g),
                                _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w0 + g))), a0);
-          a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]),
+          a1 = _mm512_fmadd_ps(broadcast_scale(s1, s1_u8, g),
                                _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w1 + g))), a1);
-          a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]),
+          a2 = _mm512_fmadd_ps(broadcast_scale(s2, s2_u8, g),
                                _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w2 + g))), a2);
-          a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]),
+          a3 = _mm512_fmadd_ps(broadcast_scale(s3, s3_u8, g),
                                _mm512_dpbf16_ps(_mm512_setzero_ps(), a, (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w3 + g))), a3);
         }
         reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
       }
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const float*   s    = use_u8 ? nullptr : bb->get_scale(n, n_pos, k, 0);
+        const uint8_t* s_u8 = use_u8 ? bb->get_scale_u8(n, n_pos, k, 0) : nullptr;
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]),
+          acc = _mm512_fmadd_ps(broadcast_scale(s, s_u8, g),
                                 _mm512_dpbf16_ps(_mm512_setzero_ps(),
                                                  a_row[g],
                                                  (__m512bh)mxfp4_to_bf16_32(_mm_loadu_si128(w + g))),
@@ -422,6 +457,27 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (config_.kt_direct_pointer) {
       if (!use_per_expert_weights || !use_per_expert_scales)
         throw std::runtime_error("kt_direct_pointer requires per-expert ptr + scale arrays.");
+      // ue8m0 scale passthrough: skip the per-expert convert_or_copy(bb->d, bf16, fp32)
+      // path; just retag bb->d_u8 to the new logical expert's mmap address. The kernel
+      // reads ue8m0 1-byte and shifts to fp32 inline.
+      // yiqiliu2 / 2026-05-07.
+      if (config_.kt_ue8m0_scale) {
+        pool->do_work_stealing_job(
+            config_.expert_num, nullptr,
+            [this, physical_to_logical_map](int task_id) {
+              uint64_t expert_idx = task_id;
+              uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+              using dt = typename T::BufferB::dt;
+              gate_bb_[expert_idx]->b = (dt*)config_.gate_projs[0][logical_expert_id];
+              up_bb_[expert_idx]->b = (dt*)config_.up_projs[0][logical_expert_id];
+              down_bb_[expert_idx]->b = (dt*)config_.down_projs[0][logical_expert_id];
+              gate_bb_[expert_idx]->d_u8 = (uint8_t*)config_.gate_scales[0][logical_expert_id];
+              up_bb_[expert_idx]->d_u8 = (uint8_t*)config_.up_scales[0][logical_expert_id];
+              down_bb_[expert_idx]->d_u8 = (uint8_t*)config_.down_scales[0][logical_expert_id];
+            },
+            nullptr);
+        return;
+      }
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
           [this, physical_to_logical_map](int task_id) {
@@ -546,6 +602,18 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                const std::vector<uintptr_t>& w13_scale_ptrs,
                                const std::vector<uintptr_t>& w2_weight_ptrs,
                                const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    // ue8m0 passthrough: this CPU→GPU write path reads gate_bb_[expert]->d (fp32)
+    // and stages it as bf16 to GPU. In ue8m0 mode bb->d is null and bb->d_u8 holds
+    // 1-byte scales. For V4-Flash with kt-num-gpu-experts=0 this path is unused;
+    // throw loudly if re-enabling GPU experts so the missing ue8m0 → bf16 staging
+    // path is added (TODO: dequantize ue8m0 directly into bf16 dst, no fp32 detour).
+    // yiqiliu2 / 2026-05-07.
+    if (gate_bb_[expert_id]->d_u8 != nullptr || up_bb_[expert_id]->d_u8 != nullptr ||
+        down_bb_[expert_id]->d_u8 != nullptr) {
+      throw std::runtime_error(
+          "write_weights_to_buffer is not yet wired for kt_ue8m0_scale mode. "
+          "Re-enable kt-num-gpu-experts only after adding ue8m0 → bf16 staging.");
+    }
     const int group_size = config_.quant_config.group_size;
     auto pool = config_.pool->get_subpool(tp_part_idx);
 

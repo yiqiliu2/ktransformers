@@ -1450,6 +1450,15 @@ class MXFP4PackedLoader:
             "w3": ("up", "up_scale"),
             "w2": ("down", "down_scale"),
         }
+        # ue8m0 passthrough (default): return raw 1-byte uint8 mmap views for the
+        # scale stream. The AMX kernel's `broadcast_scale` reads `s_u8[g]` and shifts
+        # `((uint32_t)s_u8 << 23)` to fp32 inline (lossless: ue8m0 is a pure exponent,
+        # so 2^(s-127) reproduces the value exactly). Skipping `_ue8m0_to_bf16`
+        # avoids materialising ~393 MB transient bf16 per layer. Set
+        # `KT_DISABLE_UE8M0_PASSTHROUGH=1` to fall back to the legacy bf16 layout
+        # (debug only — the C++ kernel will then read fp32 from convert_or_copy).
+        # yiqiliu2 / 2026-05-07 — TPU "store packed, dequant in compute" rule.
+        keep_bf16_legacy = os.environ.get("KT_DISABLE_UE8M0_PASSTHROUGH", "") == "1"
         for e in range(E):
             for proj in self.PROJ_NAMES:
                 rec = self.index["experts"].get(f"{L}.{e}.{proj}")
@@ -1459,16 +1468,15 @@ class MXFP4PackedLoader:
                 s_raw = self._slice_bytes(rec["s_off"], rec["s_len"])
                 w_t = self._torch_view(w_raw, rec["w_shape"], rec["w_dtype"])
                 s_raw_t = self._torch_view(s_raw, rec["s_shape"], rec["s_dtype"])
-                # Promote ue8m0 → bf16 to keep AMX kernel ABI stable for now.
-                # (P3 in the perf roadmap will defer this to inline kernel
-                # dequant; for the first packed-loader iteration we keep the
-                # legacy bf16 scale layout so we touch fewer surfaces in one
-                # change set.)
-                s_bf16 = self._ue8m0_to_bf16(s_raw_t)
+                if keep_bf16_legacy:
+                    s_out = self._ue8m0_to_bf16(s_raw_t)
+                else:
+                    # Raw uint8 mmap view (zero-copy). _torch_view returns contiguous;
+                    # data_ptr() walks the mmap region linearly. Kernel does inline shift.
+                    s_out = s_raw_t
                 w_dst, s_dst = proj_to_dst[proj]
                 out[w_dst][e] = w_t
-                out[s_dst][e] = s_bf16
-        print(f"[MXFP4PackedLoader] Loaded {E} experts for layer {L} from {self.bin_path}")
+                out[s_dst][e] = s_out
         return out
 
     def prefetch_experts(self, layer: int, expert_ids):

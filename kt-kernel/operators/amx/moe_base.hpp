@@ -145,6 +145,37 @@ class AMX_MOE_BASE {
           using dt = typename T::BufferB::dt;
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / kgs;
 
+          // ue8m0 scale passthrough: skip aligned_alloc(scale buffer) and
+          // convert_or_copy entirely. bb->d_u8 = mmap_ptr; the AMX kernel
+          // shifts ue8m0 → fp32 inline. Saves ~768 MB/layer scale heap.
+          // yiqiliu2 / 2026-05-07.
+          if (config_.kt_ue8m0_scale) {
+            auto gate_b =
+                make_buffer_b_direct(config_.intermediate_size, config_.hidden_size, /*scale_ptr=*/nullptr);
+            if (!config_.gate_projs.empty() && i < config_.gate_projs[0].size())
+              gate_b->b = (dt*)config_.gate_projs[0][i];
+            if (!config_.gate_scales.empty() && i < config_.gate_scales[0].size())
+              gate_b->d_u8 = (uint8_t*)config_.gate_scales[0][i];
+            gate_bb_.push_back(gate_b);
+
+            auto up_b =
+                make_buffer_b_direct(config_.intermediate_size, config_.hidden_size, /*scale_ptr=*/nullptr);
+            if (!config_.up_projs.empty() && i < config_.up_projs[0].size())
+              up_b->b = (dt*)config_.up_projs[0][i];
+            if (!config_.up_scales.empty() && i < config_.up_scales[0].size())
+              up_b->d_u8 = (uint8_t*)config_.up_scales[0][i];
+            up_bb_.push_back(up_b);
+
+            auto down_b =
+                make_buffer_b_direct(config_.hidden_size, config_.intermediate_size, /*scale_ptr=*/nullptr);
+            if (!config_.down_projs.empty() && i < config_.down_projs[0].size())
+              down_b->b = (dt*)config_.down_projs[0][i];
+            if (!config_.down_scales.empty() && i < config_.down_scales[0].size())
+              down_b->d_u8 = (uint8_t*)config_.down_scales[0][i];
+            down_bb_.push_back(down_b);
+            continue;
+          }
+
           void* gate_scale_ptr = std::aligned_alloc(
               64, T::BufferB::required_size_scale_only(config_.intermediate_size, config_.hidden_size, kgs));
           auto gate_b = make_buffer_b_direct(config_.intermediate_size, config_.hidden_size, gate_scale_ptr);

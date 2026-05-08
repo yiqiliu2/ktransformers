@@ -304,6 +304,16 @@ struct GeneralMOEConfig {
   // Python when use_per_expert_ptrs && tp_count == 1.
   bool kt_direct_pointer = false;
 
+  // ue8m0 scale passthrough: when true (and kt_direct_pointer is true), the
+  // per-expert ue8m0 1-byte scale is passed via mmap pointer end-to-end:
+  //   - moe_base.hpp ctor: skip aligned_alloc(scale buffer) + skip convert_or_copy
+  //   - fp4-moe.hpp load_weights: skip the per-expert convert_or_copy(bb->d, bf16, fp32)
+  //   - kernel inner loop: read 1-byte ue8m0, expand to fp32 inline via `(s<<23) bitcast<f32>`
+  // Saves ~33 GB resident heap on V4-Flash (256 experts × 43 layers × 768 MB scale fp32).
+  // The TPU "store packed, dequant in compute" rule (kimi_k26.md:111-126).
+  // yiqiliu2 / 2026-05-07.
+  bool kt_ue8m0_scale = false;
+
   // for llamafile
   int m_block = 4;
   int group_min_len = 0;

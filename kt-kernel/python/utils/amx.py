@@ -615,9 +615,17 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
-                # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
-                # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                # MXFP4 supports two scale layouts:
+                #   - ue8m0 passthrough (default for the packed loader): scales are
+                #     1-byte uint8 mmap views; the AMX kernel reads `s_u8[g]` and
+                #     shifts to fp32 inline. No load-time conversion.
+                #   - bf16 legacy: scales already promoted to bf16 (set via
+                #     KT_DISABLE_UE8M0_PASSTHROUGH=1 in the loader).
+                # The C++ `kt_ue8m0_scale` flag below dispatches accordingly.
+                assert self.gate_scales[0].dtype in (
+                    torch.uint8,
+                    torch.bfloat16,
+                ), f"Expected uint8 (ue8m0) or bf16 scales for MXFP4, got {self.gate_scales[0].dtype}"
 
         t2 = time.time()
 
@@ -656,6 +664,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+
+        # Direct-pointer mode: bb->b = mmap (no 56 GB weight heap on V4-Flash);
+        # bb->d_u8 = mmap when scales are ue8m0 (no 33 GB fp32 scale heap).
+        # Both must be on for the AMX kernel ctor to skip eager alloc + convert.
+        # Gate on MXFP4 method + per-expert ptrs + tp_count==1 (only this combo
+        # supports direct-pointer end-to-end today). yiqiliu2 / 2026-05-07.
+        if self.method == "MXFP4" and len(gate_ptrs[0]) > 0:
+            moe_config.kt_direct_pointer = True
+            if self.gate_scales[0].dtype == torch.uint8:
+                moe_config.kt_ue8m0_scale = True
 
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
