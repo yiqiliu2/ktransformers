@@ -1495,6 +1495,75 @@ class MXFP4PackedLoader:
                       f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s",
                       flush=True)
 
+        # yiqiliu2 / 2026-05-08: explicit anon-RSS buffer pool. Page cache
+        # route (mlock + prewarm) survives boot but not decode pressure:
+        # page-cache pages are first-class eviction candidates and the
+        # 137 GB blob's mmap'd cold tail competes for the same cache.
+        # With swappiness=10 (set system-wide), kernel prefers dropping
+        # cache over swapping anon RSS, so a buffer in anon RSS is
+        # "stickier" than the same data in page cache.
+        #
+        # Set KT_ANON_BUFFER_GB=N to allocate N GB of anon RSS, fill it
+        # with the first N GB of experts.bin via parallel pread, and
+        # have `_slice_bytes` return views into the anon buffer for any
+        # range that fits (falls back to mmap for offsets >= N GB).
+        # File-flag fallback at /tmp/kt_anon_buffer_gb (env stripped on
+        # multiprocessing.spawn).
+        self._anon_buf = None
+        self._anon_size = 0
+        try:
+            anon_gb = float(os.environ.get("KT_ANON_BUFFER_GB", "0"))
+        except Exception:
+            anon_gb = 0.0
+        if anon_gb <= 0 and os.path.exists("/tmp/kt_anon_buffer_gb"):
+            try:
+                with open("/tmp/kt_anon_buffer_gb") as _f:
+                    anon_gb = float(_f.read().strip())
+            except Exception:
+                pass
+        if (anon_gb > 0
+                and self._raw_fd >= 0
+                and self._prefetch_pool is not None):
+            import time as _time
+            blob_len = len(self.mm)
+            anon_bytes = min(int(anon_gb * 1024**3), blob_len)
+            try:
+                self._anon_buf = np.empty(anon_bytes, dtype=np.uint8)
+            except MemoryError as e:
+                print(f"[MXFP4PackedLoader] anon buffer alloc failed: {e}; "
+                      f"falling back to mmap-only", flush=True)
+                self._anon_buf = None
+            if self._anon_buf is not None:
+                self._anon_size = anon_bytes
+                CHUNK = 4 * 1024 * 1024
+                fd = self._raw_fd
+                buf = self._anon_buf
+
+                def _fill_chunk(off, ln):
+                    mv = memoryview(buf)[off:off+ln]
+                    return os.preadv(fd, [mv], off)
+
+                print(f"[MXFP4PackedLoader] filling anon buffer "
+                      f"{anon_bytes/1e9:.1f} GB with {workers}-thread pread...",
+                      flush=True)
+                _t0 = _time.time()
+                _futs = []
+                for _off in range(0, anon_bytes, CHUNK):
+                    _ln = min(CHUNK, anon_bytes - _off)
+                    _futs.append(self._prefetch_pool.submit(_fill_chunk, _off, _ln))
+                _read = 0
+                for _f in _futs:
+                    try:
+                        _read += _f.result()
+                    except Exception as _ex:
+                        print(f"[MXFP4PackedLoader] anon-fill chunk error: {_ex}",
+                              flush=True)
+                _el = _time.time() - _t0
+                print(f"[MXFP4PackedLoader] anon buffer ready: "
+                      f"{_read/1e9:.1f} GB in {_el:.1f}s "
+                      f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s "
+                      f"(immune to page-cache eviction)", flush=True)
+
     # API parity with MXFP4SafeTensorLoader (the only methods used by the kt-kernel path).
     def has_tensor(self, name: str) -> bool:
         # Best-effort emulation: parse "..layers.{L}.ffn.experts.{E}.{proj}.weight" or .scale
@@ -1515,6 +1584,11 @@ class MXFP4PackedLoader:
         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
 
     def _slice_bytes(self, offset: int, length: int) -> np.ndarray:
+        # yiqiliu2 / 2026-05-08: prefer anon-RSS buffer if range fits,
+        # else fall back to mmap. Anon buffer is sticky (immune to
+        # page-cache eviction); mmap path is the existing route.
+        if self._anon_buf is not None and (offset + length) <= self._anon_size:
+            return self._anon_buf[offset:offset + length]
         return self.mm[offset:offset + length]
 
     def _torch_view(self, raw: np.ndarray, shape, dtype_str: str) -> torch.Tensor:
