@@ -1495,22 +1495,26 @@ class MXFP4PackedLoader:
                       f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s",
                       flush=True)
 
-        # yiqiliu2 / 2026-05-08: explicit anon-RSS buffer pool. Page cache
-        # route (mlock + prewarm) survives boot but not decode pressure:
-        # page-cache pages are first-class eviction candidates and the
-        # 137 GB blob's mmap'd cold tail competes for the same cache.
-        # With swappiness=10 (set system-wide), kernel prefers dropping
-        # cache over swapping anon RSS, so a buffer in anon RSS is
-        # "stickier" than the same data in page cache.
+        # yiqiliu2 / 2026-05-08: explicit anon-RSS buffer pool with
+        # frequency-targeted fill. Page cache route (mlock + prewarm)
+        # survives boot but not decode pressure. With swappiness=10
+        # anon RSS is stickier than page cache.
         #
-        # Set KT_ANON_BUFFER_GB=N to allocate N GB of anon RSS, fill it
-        # with the first N GB of experts.bin via parallel pread, and
-        # have `_slice_bytes` return views into the anon buffer for any
-        # range that fits (falls back to mmap for offsets >= N GB).
-        # File-flag fallback at /tmp/kt_anon_buffer_gb (env stripped on
-        # multiprocessing.spawn).
+        # Two modes:
+        #   - KT_ANON_BUFFER_GB=N alone: legacy mode, fills first N GB
+        #     of blob sequentially. Coverage = N/137 GB ≈ 44%.
+        #   - KT_ANON_BUFFER_GB=N + KT_HOT_EXPERTS_PT=path: frequency-
+        #     targeted mode. Reads logical_count.pt warmup data, picks
+        #     top-K hottest (L, E) chunks (each 13.4 MB), copies them
+        #     into the anon buffer, builds a chunk_id→anon_offset map.
+        #     With same-size budget, hot 44% of experts cover ~80% of
+        #     routing in typical MoE distributions.
+        #
+        # File-flag fallbacks: /tmp/kt_anon_buffer_gb, /tmp/kt_hot_experts_pt.
         self._anon_buf = None
         self._anon_size = 0
+        self._chunk_size = 0  # 0 means legacy sequential mode
+        self._hot_anon_start = None
         try:
             anon_gb = float(os.environ.get("KT_ANON_BUFFER_GB", "0"))
         except Exception:
@@ -1521,48 +1525,136 @@ class MXFP4PackedLoader:
                     anon_gb = float(_f.read().strip())
             except Exception:
                 pass
+        hot_pt_path = os.environ.get("KT_HOT_EXPERTS_PT", "")
+        if not hot_pt_path and os.path.exists("/tmp/kt_hot_experts_pt"):
+            try:
+                with open("/tmp/kt_hot_experts_pt") as _f:
+                    hot_pt_path = _f.read().strip()
+            except Exception:
+                hot_pt_path = ""
+
         if (anon_gb > 0
                 and self._raw_fd >= 0
                 and self._prefetch_pool is not None):
             import time as _time
             blob_len = len(self.mm)
-            anon_bytes = min(int(anon_gb * 1024**3), blob_len)
-            try:
-                self._anon_buf = np.empty(anon_bytes, dtype=np.uint8)
-            except MemoryError as e:
-                print(f"[MXFP4PackedLoader] anon buffer alloc failed: {e}; "
-                      f"falling back to mmap-only", flush=True)
-                self._anon_buf = None
-            if self._anon_buf is not None:
-                self._anon_size = anon_bytes
-                CHUNK = 4 * 1024 * 1024
-                fd = self._raw_fd
-                buf = self._anon_buf
+            target_bytes = int(anon_gb * 1024**3)
+            fd = self._raw_fd
 
-                def _fill_chunk(off, ln):
-                    mv = memoryview(buf)[off:off+ln]
-                    return os.preadv(fd, [mv], off)
+            # ---- Frequency-targeted path ----
+            if hot_pt_path and os.path.isfile(hot_pt_path):
+                try:
+                    pt = torch.load(hot_pt_path, map_location="cpu", weights_only=True)
+                    if isinstance(pt, dict) and "logical_count" in pt:
+                        counts = pt["logical_count"]
+                    else:
+                        counts = pt
+                    if counts.dim() == 3:
+                        freq = counts.sum(dim=0).float().flatten()  # [L*E]
+                    else:
+                        freq = counts.float().flatten()
+                    n_chunks = self.layer_count * self.expert_count
+                    if freq.numel() != n_chunks:
+                        raise ValueError(
+                            f"hot pt shape {freq.numel()} doesn't match "
+                            f"L({self.layer_count})*E({self.expert_count})={n_chunks}"
+                        )
 
-                print(f"[MXFP4PackedLoader] filling anon buffer "
-                      f"{anon_bytes/1e9:.1f} GB with {workers}-thread pread...",
-                      flush=True)
-                _t0 = _time.time()
-                _futs = []
-                for _off in range(0, anon_bytes, CHUNK):
-                    _ln = min(CHUNK, anon_bytes - _off)
-                    _futs.append(self._prefetch_pool.submit(_fill_chunk, _off, _ln))
-                _read = 0
-                for _f in _futs:
-                    try:
-                        _read += _f.result()
-                    except Exception as _ex:
-                        print(f"[MXFP4PackedLoader] anon-fill chunk error: {_ex}",
-                              flush=True)
-                _el = _time.time() - _t0
-                print(f"[MXFP4PackedLoader] anon buffer ready: "
-                      f"{_read/1e9:.1f} GB in {_el:.1f}s "
-                      f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s "
-                      f"(immune to page-cache eviction)", flush=True)
+                    # Determine chunk size from index (assumes all (L,E) experts have same byte size).
+                    first_le = self.index["experts"].get("0.0.w1")
+                    second_le = self.index["experts"].get("0.1.w1")
+                    if first_le and second_le:
+                        chunk_size = int(second_le["w_off"]) - int(first_le["w_off"])
+                    else:
+                        chunk_size = 13369344  # known-good default for V4-Flash
+
+                    n_hot = min(target_bytes // chunk_size, n_chunks)
+                    if n_hot <= 0:
+                        raise ValueError(f"n_hot computed as {n_hot} (anon_gb too small for chunk_size {chunk_size})")
+
+                    # Sort chunks by descending frequency, take top-N.
+                    hot_indices = torch.argsort(freq, descending=True)[:n_hot].tolist()
+
+                    anon_size = n_hot * chunk_size
+                    print(f"[MXFP4PackedLoader] frequency-targeted: "
+                          f"allocating {anon_size/1e9:.1f} GB anon for "
+                          f"top {n_hot}/{n_chunks} ({100.0*n_hot/n_chunks:.1f}%) "
+                          f"hot experts (chunk_size {chunk_size/1e6:.1f} MB)...",
+                          flush=True)
+                    self._anon_buf = np.empty(anon_size, dtype=np.uint8)
+                    self._anon_size = anon_size
+                    self._chunk_size = chunk_size
+                    self._hot_anon_start = np.full(n_chunks, -1, dtype=np.int64)
+                    for i, ch_idx in enumerate(hot_indices):
+                        self._hot_anon_start[ch_idx] = i * chunk_size
+
+                    buf = self._anon_buf
+                    def _fill_expert(ch_idx, anon_off):
+                        orig_off = ch_idx * chunk_size
+                        mv = memoryview(buf)[anon_off:anon_off+chunk_size]
+                        return os.preadv(fd, [mv], orig_off)
+
+                    print(f"[MXFP4PackedLoader] filling {n_hot} hot experts "
+                          f"with {workers}-thread pread...", flush=True)
+                    _t0 = _time.time()
+                    _futs = []
+                    for i, ch_idx in enumerate(hot_indices):
+                        _futs.append(self._prefetch_pool.submit(_fill_expert, ch_idx, i * chunk_size))
+                    _read = 0
+                    for _f in _futs:
+                        try:
+                            _read += _f.result()
+                        except Exception as _ex:
+                            print(f"[MXFP4PackedLoader] anon-fill chunk error: {_ex}", flush=True)
+                    _el = _time.time() - _t0
+                    print(f"[MXFP4PackedLoader] anon buffer ready (frequency-targeted): "
+                          f"{_read/1e9:.1f} GB in {_el:.1f}s "
+                          f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s",
+                          flush=True)
+                except Exception as _e:
+                    print(f"[MXFP4PackedLoader] frequency-targeted fill failed: {_e!r}; "
+                          f"falling back to legacy sequential fill", flush=True)
+                    self._anon_buf = None
+                    self._chunk_size = 0
+                    self._hot_anon_start = None
+
+            # ---- Legacy sequential path (fallback or when no .pt) ----
+            if self._anon_buf is None:
+                anon_bytes = min(target_bytes, blob_len)
+                try:
+                    self._anon_buf = np.empty(anon_bytes, dtype=np.uint8)
+                except MemoryError as e:
+                    print(f"[MXFP4PackedLoader] anon buffer alloc failed: {e}; "
+                          f"falling back to mmap-only", flush=True)
+                    self._anon_buf = None
+                if self._anon_buf is not None:
+                    self._anon_size = anon_bytes
+                    CHUNK = 4 * 1024 * 1024
+                    buf = self._anon_buf
+
+                    def _fill_chunk(off, ln):
+                        mv = memoryview(buf)[off:off+ln]
+                        return os.preadv(fd, [mv], off)
+
+                    print(f"[MXFP4PackedLoader] filling anon buffer "
+                          f"{anon_bytes/1e9:.1f} GB with {workers}-thread pread...",
+                          flush=True)
+                    _t0 = _time.time()
+                    _futs = []
+                    for _off in range(0, anon_bytes, CHUNK):
+                        _ln = min(CHUNK, anon_bytes - _off)
+                        _futs.append(self._prefetch_pool.submit(_fill_chunk, _off, _ln))
+                    _read = 0
+                    for _f in _futs:
+                        try:
+                            _read += _f.result()
+                        except Exception as _ex:
+                            print(f"[MXFP4PackedLoader] anon-fill chunk error: {_ex}", flush=True)
+                    _el = _time.time() - _t0
+                    print(f"[MXFP4PackedLoader] anon buffer ready (legacy sequential): "
+                          f"{_read/1e9:.1f} GB in {_el:.1f}s "
+                          f"= {(_read/1e9/_el if _el>0 else 0):.2f} GB/s",
+                          flush=True)
 
     # API parity with MXFP4SafeTensorLoader (the only methods used by the kt-kernel path).
     def has_tensor(self, name: str) -> bool:
@@ -1584,9 +1676,19 @@ class MXFP4PackedLoader:
         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
 
     def _slice_bytes(self, offset: int, length: int) -> np.ndarray:
-        # yiqiliu2 / 2026-05-08: prefer anon-RSS buffer if range fits,
-        # else fall back to mmap. Anon buffer is sticky (immune to
-        # page-cache eviction); mmap path is the existing route.
+        # yiqiliu2 / 2026-05-08: 3-tier lookup
+        #   1. frequency-targeted chunked anon (per-(L,E) remap; chunk_size > 0)
+        #   2. legacy sequential anon (offset < anon_size)
+        #   3. mmap fallback
+        if self._chunk_size > 0:
+            ch_idx = offset // self._chunk_size
+            offset_within = offset - ch_idx * self._chunk_size
+            if (offset_within + length <= self._chunk_size
+                    and 0 <= ch_idx < self._hot_anon_start.shape[0]):
+                anon_off = int(self._hot_anon_start[ch_idx])
+                if anon_off >= 0:
+                    return self._anon_buf[anon_off + offset_within : anon_off + offset_within + length]
+            return self.mm[offset:offset + length]
         if self._anon_buf is not None and (offset + length) <= self._anon_size:
             return self._anon_buf[offset:offset + length]
         return self.mm[offset:offset + length]
@@ -1723,6 +1825,67 @@ class MXFP4PackedLoader:
                 continue
             try:
                 self._prefetch_pool.submit(_pread_chunk, s, length)
+            except Exception:
+                pass
+
+    def prefetch_experts_sync(self, layer: int, expert_ids):
+        """Synchronous variant of ``prefetch_experts``: submits the per-range
+        pread chunks to the 8-thread pool and **blocks** until every chunk
+        completes. Use this when the caller needs page cache to be warm before
+        the AMX kernel reads bytes — the inference forward path's biggest
+        single-step lever, since mmap-fault is single-threaded ~100 MB/s while
+        an 8-thread pread microbench measures 5.58 GB/s on the same fd.
+
+        For ~80 MB of routed-expert bytes per layer (6 experts × 13.4 MB), the
+        wait is ~14 ms vs ~800 ms of cumulative mmap-fault stall the AMX
+        kernel would otherwise pay. yiqiliu2 / 2026-05-08.
+        """
+        if not hasattr(self, "_prefetch_pool") or self._prefetch_pool is None:
+            return
+        if not hasattr(self, "_raw_fd") or self._raw_fd < 0:
+            return
+        ranges = []
+        for e in expert_ids:
+            for proj in self.PROJ_NAMES:
+                rec = self.index["experts"].get(f"{layer}.{int(e)}.{proj}")
+                if rec is None:
+                    continue
+                ranges.append((rec["w_off"], rec["s_off"] + rec["s_len"]))
+        if not ranges:
+            return
+        ranges.sort()
+        merged = [list(ranges[0])]
+        for start, end in ranges[1:]:
+            if start <= merged[-1][1] + 262144:
+                if end > merged[-1][1]:
+                    merged[-1][1] = end
+            else:
+                merged.append([start, end])
+
+        fd = self._raw_fd
+
+        def _pread_chunk(off: int, length: int) -> None:
+            CHUNK = 1024 * 1024
+            pos = off
+            remaining = length
+            while remaining > 0:
+                n = min(CHUNK, remaining)
+                _ = os.pread(fd, n, pos)
+                pos += n
+                remaining -= n
+
+        futs = []
+        for s, e in merged:
+            length = e - s
+            if length <= 0:
+                continue
+            try:
+                futs.append(self._prefetch_pool.submit(_pread_chunk, s, length))
+            except Exception:
+                pass
+        for f in futs:
+            try:
+                f.result()
             except Exception:
                 pass
 
